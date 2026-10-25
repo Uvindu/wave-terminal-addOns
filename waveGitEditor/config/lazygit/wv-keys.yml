@@ -1,0 +1,19 @@
+# wv-keys overlay for lazygit — loaded ONLY by wv via
+#   lazygit --use-config-file=<user config>,<wv-cockpit>,<this file>
+# so standalone lazygit keeps its own keybindings.
+#
+# Ships the wv-specific custom commands. Later files win on key conflicts
+# (verified against lazygit v0.66.2), so these override same-key entries in
+# the user config inside the cockpit only.
+customCommands:
+  - key: "O"
+    context: "files"
+    command: "~/.local/bin/wvopen file {{.SelectedFile.Name}}"
+    description: "Open selected file diff in CR web view"
+    output: none
+  - key: <enter>
+    context: commits, subCommits
+    description: Open commit in Gerrit-CR web view
+    command: ~/.local/bin/wvopen commit {{.SelectedCommit.Hash}}
+    output: none
+    loadingText: opening CR view

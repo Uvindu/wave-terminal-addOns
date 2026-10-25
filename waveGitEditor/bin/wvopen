@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# wvopen — open/refresh the wv Gerrit-CR web view from lazygit or a shell.
+#
+# Usage:
+#   wvopen commit <full-or-short-sha>   → open that commit's CR view
+#   wvopen worktree                     → open the working-tree view
+#   wvopen file <path>                  → open the worktree view expanded on
+#                                         that file's diff (deep link)
+#
+# Reuses the recorded web block (wsh web open -r) so the Wave layout keeps
+# one web block per repo; if the block is gone (closed), opens a fresh one
+# and records it. Silent on success; exit 1 quietly when wsh has no Wave
+# JWT (started outside Wave).
+set -uo pipefail
+
+mode=${1:?usage: wvopen commit <sha> | wvopen worktree | wvopen file <path>}
+
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || exit 1
+
+url_path="/"
+if [ "$mode" = commit ]; then
+    sha=${2:?usage: wvopen commit <sha>}
+    full=$(git rev-parse --verify --quiet "$sha^{commit}" 2>/dev/null) || exit 1
+    url_path="/commit/$full"
+elif [ "$mode" = file ]; then
+    p=${2:?usage: wvopen file <path>}
+    [ -e "$p" ] || exit 1
+    # URL-encode (order critical: % first)
+    enc=$(printf '%s' "$p" | sed 's/%/%25/g; s/ /%20/g; s/&/%26/g; s/#/%23/g; s/?/%3F/g')
+    url_path="/?expand=$enc"
+fi
+
+state_dir="$HOME/.local/state/wv"
+port=$("$HOME/.local/bin/wvdiff-ensure" "$repo") || exit 1
+url="http://127.0.0.1:${port}${url_path}"
+key=$(printf '%s' "$repo" | md5sum | cut -d' ' -f1)
+blockfile="$state_dir/$key.webblock"
+
+bid_re='block: *\([0-9a-f-]\{36\}\)'
+
+open_and_record() { # plain open; record new block id if output carries one
+    local out
+    out=$(wsh web open "$url" 2>&1) || return 1
+    local bid
+    bid=$(printf '%s\n' "$out" | sed -n "s/.*$bid_re.*/\1/p")
+    if [ -n "$bid" ]; then
+        printf '%s\n' "$bid" > "$blockfile"
+    fi
+    # no id in output: leave file absent — degraded mode, fresh block each time
+    return 0
+}
+
+# reuse recorded block if it is still alive
+if [ -s "$blockfile" ]; then
+    bid=$(head -n1 "$blockfile")
+    if [ -n "$bid" ] && wsh getmeta -b "$bid" >/dev/null 2>&1; then
+        if wsh web open -r "$bid" "$url" >/dev/null 2>&1; then
+            exit 0
+        fi
+        # reuse failed (stale/corrupt id): fall through to plain open
+    fi
+    rm -f "$blockfile"
+fi
+
+open_and_record || exit 1

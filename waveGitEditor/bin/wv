@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# wv — open a Wave Terminal cockpit for a git repo.
+#
+# Usage: wv [--clean] [<dir>] [--omp] [--review]
+#   Opens: a directory preview, a narrow lazygit column (its gui config
+#   stacks all panels vertically, so it works in a slim block), and a
+#   wide Gerrit-CR web view (wvdiff: working tree + vs-upstream + log +
+#   per-commit diffs, side-by-side, fluid width; stage/unstage/discard,
+#   commit box, reviewed marks, filters, j/k keys). The omp AI block does
+#   most file edits; review and approve in the web diff, commit from the
+#   web box or lazygit. --review adds a live diff vs upstream (aidiff --vs).
+#   --omp adds an omp (local LLM) block. --clean closes the cockpit:
+#   deletes its blocks, stops its wvdiff server, clears state.
+#
+# Idempotency: the web block id is stored per repo in
+# ~/.local/state/wv/<md5>.webblock; while that block is alive (probed via
+# `wsh getmeta`), a second wv just focuses it instead of spawning a
+# duplicate. Terminal blocks (lazygit, --review, --omp) are tracked the
+# old way in the sibling <md5> file.
+#
+# Note: wsh run blocks run via the connserver — they start in ~ without
+# ~/.local/bin on PATH, no EDITOR set, and no ~/.waveterm/bin/wsh reachable,
+# so PATH + Wave vars (WAVETERM_JWT, wsh, EDITOR) are exported explicitly.
+# They also inherit no shell env, so the omp block gets its credentials
+# (RAPID_CLIENT_TOKEN / ANTHROPIC_*) passed through explicitly (see
+# omp_env_prefix) — without them omp fails every request with 401.
+# A leading "cd <dir>" in the command string is swallowed by Wave's cmd
+# parser, so PATH is exported first and the cd comes mid-command.
+set -euo pipefail
+
+dir="." omp=0 review=0 clean=0
+for arg in "${@:-}"; do
+    case "$arg" in
+        --omp)    omp=1 ;;
+        --review) review=1 ;;
+        --clean)  clean=1 ;;
+        *)        dir="$arg" ;;
+    esac
+done
+
+repo=$(cd "$dir" 2>/dev/null && git rev-parse --show-toplevel) || {
+    echo "wv: not a git repository: $dir" >&2; exit 1; }
+command -v wsh >/dev/null || { echo "wv: wsh not found — run inside Wave Terminal" >&2; exit 1; }
+
+qrepo=$(printf '%q' "$repo")
+state_dir="$HOME/.local/state/wv"
+state_file="$state_dir/$(printf '%s' "$repo" | md5sum | cut -d' ' -f1)"
+webblock_file="${state_file}.webblock"
+mkdir -p "$state_dir"
+
+# --- --clean: delete the cockpit's blocks, stop its server, clear state
+if [ "$clean" = 1 ]; then
+    if [ -f "$state_file" ]; then
+        while IFS= read -r bid; do
+            [ -n "$bid" ] && wsh deleteblock -b "$bid" >/dev/null 2>&1 || true
+        done < "$state_file"
+    fi
+    if [ -s "$webblock_file" ]; then
+        wbid=$(head -n1 "$webblock_file")
+        [ -n "$wbid" ] && wsh deleteblock -b "$wbid" >/dev/null 2>&1 || true
+    fi
+    port=$(cat "${state_file}.port" 2>/dev/null || true)
+    if [ -n "${port:-}" ]; then
+        pid=$(curl -fsS -m 2 "http://127.0.0.1:${port}/healthz" 2>/dev/null \
+            | python3 -c 'import json,sys;print(json.load(sys.stdin)["pid"])' 2>/dev/null || true)
+        [ -n "${pid:-}" ] && kill "$pid" 2>/dev/null || true
+    fi
+    rm -f "$state_file" "$webblock_file" "${state_file}.port" "${state_file}.lock"
+    echo "wv: cockpit for ${repo##*/} closed"
+    exit 0
+fi
+
+wvdiff_port=$("$HOME/.local/bin/wvdiff-ensure" "$repo") || wvdiff_port=""
+web_url=""
+[ -n "$wvdiff_port" ] && web_url="http://127.0.0.1:${wvdiff_port}/"
+
+# --- idempotency: web block alive → focus it and the terminal blocks, done
+web_bid=""
+if [ -s "$webblock_file" ]; then
+    web_bid=$(head -n1 "$webblock_file")
+fi
+if [ -n "$web_bid" ] && wsh getmeta -b "$web_bid" >/dev/null 2>&1; then
+    # refresh the existing web block to the worktree view, focus everything
+    [ -n "$web_url" ] && wsh web open -r "$web_bid" "$web_url" >/dev/null 2>&1 || true
+    wsh focusblock -b "$web_bid" >/dev/null 2>&1 || true
+    if [ -f "$state_file" ]; then
+        while IFS= read -r bid; do
+            [ -n "$bid" ] && wsh focusblock -b "$bid" >/dev/null 2>&1 || true
+        done < "$state_file"
+    fi
+    echo "wv: cockpit for ${repo##*/} already open — focused existing blocks"
+    exit 0
+fi
+
+# --- block spawner for terminal blocks (--review / --omp): records each new
+# block id in the state file.
+# Exports what the blocks need: wsh on PATH, EDITOR=wsh editor (Wave graphical
+# editor) and the invoking session's Wave vars (JWT, blockid). wv runs from an
+# interactive Wave shell so those vars are in its env; blocks run via the
+# connserver without them.
+wsh_dir="$(dirname "$(command -v wsh)")"
+wave_env_setup="export PATH=\"$HOME/.local/bin:$wsh_dir:\$PATH\""
+# Block commands run without Wave env; inject it so they can call wsh
+# (which needs WAVETERM_JWT to reach the router).
+# The JWT literal goes into the command string — same exposure surface as the
+# wavesrv "full combined command" log line that already logs every block cmd.
+[ -n "${WAVETERM_JWT:-}" ] && wave_env_setup="$wave_env_setup WAVETERM_JWT=$(printf '%q' "$WAVETERM_JWT")"
+[ -n "${WAVETERM_BLOCKID:-}" ] && wave_env_setup="$wave_env_setup WAVETERM_BLOCKID=\"\${WAVETERM_BLOCKID}\""
+[ -n "${WAVETERM_CONN:-}" ] && wave_env_setup="$wave_env_setup WAVETERM_CONN=\"\${WAVETERM_CONN}\""
+wave_env_setup="$wave_env_setup EDITOR=\"wsh editor\" VISUAL=\"wsh editor\" GIT_EDITOR=\"wsh editor\""
+
+# Credential passthrough, omp block only: omp's rapid provider reads its
+# bearer token from RAPID_CLIENT_TOKEN (~/.omp/agent/models.yml apiKey), and
+# local-LLM gateways use the ANTHROPIC_* pair. Blocks inherit neither wv's
+# env nor bashrc (connserver spawn), so without this omp dies on first
+# message with "401 Missing or invalid bearer token". The vars ride as
+# `env VAR=... ` prefix args (exec rejects "exec VAR=v cmd" forms), built with
+# %q so token punctuation survives the double round of shell parsing.
+omp_env_prefix=""
+for ck in RAPID_CLIENT_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_AUTH_TOKEN; do
+    [ -n "${!ck:-}" ] && omp_env_prefix="$omp_env_prefix $(printf '%q' "$ck")=$(printf '%q' "${!ck}")"
+done
+
+run_in_repo() {
+    # leading "true;" stops Wave's parser from swallowing a leading export/cd
+    local out bid
+    out=$(wsh run --cwd "$repo" -c "true; $wave_env_setup; cd $qrepo && exec $*" 2>&1)
+    bid=$(printf '%s\n' "$out" | sed -n 's/.*block: *\([0-9a-f-]\{36\}\).*/\1/p')
+    if [ -n "$bid" ]; then
+        printf '%s\n' "$bid" >> "$state_file"
+        case "$*" in
+            *lazygit*) title_block "$bid" "lg: ${repo##*/}" "code-branch" ;;
+            *aidiff*)  title_block "$bid" "aidiff: ${repo##*/}" "code-compare" ;;
+            *omp*)     title_block "$bid" "omp: ${repo##*/}" "robot" ;;
+        esac
+    fi
+}
+
+# --- block titles (#10): frame:title/frame:icon via wsh setmeta; silent no-ops
+title_block(){
+    [ -n "${1:-}" ] && wsh setmeta -b "$1" frame:title="$2" frame:icon="$3" >/dev/null 2>&1 || true
+}
+
+: > "$state_file"
+
+if [ "$review" = 1 ]; then
+    upstream=$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name @{upstream} 2>/dev/null || true)
+    if [ -z "$upstream" ]; then
+        if git -C "$repo" rev-parse -q --verify origin/master >/dev/null 2>&1; then
+            upstream=origin/master
+        else
+            upstream=HEAD
+        fi
+    fi
+    run_in_repo "\"\$HOME/.local/bin/aidiff\" -w --vs $(printf '%q' "$upstream")"
+fi
+
+# Narrow lazygit column: spawned before the web view, so Wave's
+# auto-placement puts it left of the web block (drag it narrow once).
+# The cockpit overlay config (sidePanelWidth/enlargedSideViewLocation)
+# tunes the stacked layout lazygit auto-uses in narrow windows; the
+# user config is loaded too so custom commands keep working.
+run_in_repo "\"\$HOME/.local/bin/lazygit\" --use-config-file=\$HOME/.config/lazygit/config.yml,\$HOME/.config/lazygit/wv-cockpit.yml,\$HOME/.config/lazygit/wv-keys.yml"
+
+wsh view "$repo" >/dev/null
+
+# Gerrit-CR web view (wvdiff): open the web block, record its id as the
+# cockpit anchor. Directory preview above stays.
+if [ -n "$web_url" ]; then
+    web_out=$(wsh web open "$web_url" 2>&1 || true)
+    web_bid=$(printf '%s\n' "$web_out" | sed -n 's/.*block: *\([0-9a-f-]\{36\}\).*/\1/p')
+    [ -n "$web_bid" ] && printf '%s\n' "$web_bid" > "$webblock_file"
+    title_block "$web_bid" "CR: ${repo##*/}" "code-compare"
+fi
+if [ "$omp" = 1 ]; then
+    run_in_repo "env$omp_env_prefix \"\$HOME/.local/bin/omp\""
+fi
+wsh focusblock -b this

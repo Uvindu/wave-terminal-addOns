@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# wvdiff-ensure <repo-abs-path> — ensure a wvdiff server for the repo; print port.
+# Idempotent + concurrency-safe: server writes its port file only after bind.
+set -euo pipefail
+
+repo=${1:?usage: wvdiff-ensure <repo-abs-path>}
+repo=$(cd "$repo" 2>/dev/null && git -C "$repo" rev-parse --show-toplevel 2>/dev/null) || repo=$1
+[ -d "$repo/.git" ] || { echo "wvdiff-ensure: not a git repo: $repo" >&2; exit 1; }
+
+state_dir="$HOME/.local/state/wv"
+mkdir -p "$state_dir"
+key=$(printf '%s' "$repo" | md5sum | cut -d' ' -f1)
+portfile="$state_dir/$key.port"
+logfile="$state_dir/wvdiff.log"
+srv="$HOME/.local/bin/wvdiff"
+
+healthy() { # port -> 0 if a live wvdiff serves THIS repo on that port, and
+    # its code is not older than the wvdiff binary (else kill + respawn).
+    local port=$1 json pid
+    json=$(curl -fsS -m 2 "http://127.0.0.1:${port}/healthz" 2>/dev/null) || return 1
+    printf '%s' "$json" | grep -q "\"repo\": *\"${repo}\"" || return 1
+    # code freshness: server older than binary → kill it, caller respawns
+    if command -v python3 >/dev/null 2>&1; then
+        if python3 - "$json" "$srv" <<'PYEOF' 2>/dev/null
+import json as j, os, sys
+try:
+    d = j.loads(sys.argv[1])
+    if d.get("code_mtime", 0) < os.stat(sys.argv[2]).st_mtime:
+        sys.exit(3)  # stale
+    sys.exit(0)
+except Exception:
+    sys.exit(0)  # malformed JSON → treat as healthy (old behavior)
+PYEOF
+        then :
+        elif [ $? -eq 3 ]; then
+            pid=$(printf '%s' "$json" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("pid",""))' 2>/dev/null)
+            [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+            # wait up to 2s: SIGTERM handler unlinks the port file
+            for _ in $(seq 1 20); do
+                [ -f "$portfile" ] || break
+                sleep 0.1
+            done
+            rm -f "$portfile"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# fast path: recorded port still serves this repo
+if [ -f "$portfile" ]; then
+    port=$(head -n1 "$portfile" 2>/dev/null || true)
+    if [ -n "${port:-}" ] && healthy "$port"; then
+        echo "$port"
+        exit 0
+    fi
+    rm -f "$portfile"
+fi
+
+# spawn detached; server removes its port file on exit, writes it after bind
+setsid nohup python3 "$srv" --repo "$repo" --port 0 >> "$logfile" 2>&1 < /dev/null &
+disown 2>/dev/null || true
+
+for _ in $(seq 1 30); do
+    if [ -f "$portfile" ]; then
+        port=$(head -n1 "$portfile" 2>/dev/null || true)
+        if [ -n "${port:-}" ] && healthy "$port"; then
+            echo "$port"
+            exit 0
+        fi
+        rm -f "$portfile"
+    fi
+    sleep 0.1
+done
+
+echo "wvdiff-ensure: server failed to start for $repo (see $logfile)" >&2
+exit 1

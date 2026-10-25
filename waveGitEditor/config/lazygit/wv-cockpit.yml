@@ -1,0 +1,15 @@
+# wv-cockpit overlay for lazygit — loaded ONLY by wv via
+#   lazygit --use-config-file=<user config>,<this file>
+# so standalone lazygit keeps its default layout.
+#
+# In a narrow block (< ~100 cols) lazygit auto-stacks all side panels
+# above the main panel — the wv cockpit column layout comes for free;
+# nothing here forces it. What this overlay tunes:
+# - sidePanelWidth 0.6: in the stacked layout this is the height share
+#   of the side panels ([1]-[5]); 0.6 keeps Files/Commits readable,
+#   the patch panel below gets the rest.
+# - enlargedSideViewLocation top: the '+' half-screen mode puts the
+#   focused side panel on top, main view below (stacked, not left/right).
+gui:
+  sidePanelWidth: 0.6
+  enlargedSideViewLocation: top

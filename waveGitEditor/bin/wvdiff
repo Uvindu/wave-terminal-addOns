@@ -1,0 +1,1408 @@
+#!/usr/bin/env python3
+"""wvdiff — local HTTP server backing the wv Gerrit-CR web view.
+
+Serves a dark Gerrit-like review page (working tree, log, per-commit patches)
+for one git repo, plus JSON/diff APIs consumed by that page. Python 3 stdlib
+only; binds 127.0.0.1; one server per repo; exits after idle timeout.
+
+Usage: wvdiff --repo <abs-path> [--port N]   (port 0 = ephemeral)
+
+State: ~/.local/state/wv/<md5-of-repo-path>.port  (port line)
+       ~/.local/state/wv/wvdiff.log               (append)
+"""
+
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import shutil
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import unquote, urlparse
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+STATE_DIR = os.path.expanduser("~/.local/state/wv")
+ASSETS_DIR = os.path.expanduser("~/.local/share/wvdiff/assets")
+IDLE_SECS = int(os.environ.get("WVDIFF_IDLE_SECS", "7200"))
+
+REPO = None
+PORT_FILE = None
+LOG_FILE = os.path.join(STATE_DIR, "wvdiff.log")
+LAST_REQUEST = time.time()
+CODE_MTIME = os.path.getmtime(os.path.abspath(__file__))
+
+
+def log(msg):
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write("%s wvdiff[%d] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), msg))
+    except OSError:
+        pass
+
+
+def git(*args, binary=False):
+    """Run git -C REPO, return stdout. Raises RuntimeError on failure."""
+    cmd = ["git", "-C", REPO] + list(args)
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError("git %s failed: %s" % (" ".join(args[:3]), r.stderr.decode("utf-8", "replace").strip()))
+    return r.stdout if binary else r.stdout.decode("utf-8", "replace")
+
+
+def head_or_empty_tree():
+    try:
+        return git("rev-parse", "--verify", "HEAD").strip()
+    except RuntimeError:
+        return EMPTY_TREE
+
+def parse_numstat_z(out):
+    """Parse `git diff --numstat -z` output → {newpath: (add, del, oldpath)}.
+
+    Rename rows: `add\\tdel\\t<NUL>old<NUL>new<NUL>` → keyed by new path.
+    Binary rows report '-' for both counts.
+    """
+    fields = out.split("\0")
+    files = {}
+    i = 0
+    while i < len(fields):
+        f = fields[i]
+        if not f:
+            i += 1
+            continue
+        parts = f.split("\t")
+        if len(parts) < 3:
+            i += 1
+            continue
+        add, dele, path = parts[0], parts[1], parts[2]
+        if path == "":  # rename: next two fields are old, new
+            if i + 2 < len(fields):
+                files[fields[i + 2]] = (add, dele, fields[i + 1])
+            i += 3
+            continue
+        files[path] = (add, dele, None)
+        i += 1
+    return files
+
+
+def parse_name_status_z(out):
+    """Parse `git diff --name-status -z -M` output → {newpath: (letter, oldpath)}.
+
+    -z field layout: `D\\0<path>\\0`, `M\\0<path>\\0`, `R056\\0<old>\\0<new>\\0`.
+    """
+    fields = [f for f in out.split("\0") if f != ""]
+    files = {}
+    i = 0
+    while i < len(fields):
+        f = fields[i]
+        if f and f[0].isupper() and (len(f) == 1 or f[1:].isdigit()):
+            letter = f[0]
+            if letter in ("R", "C") and i + 2 < len(fields):
+                files[fields[i + 2]] = (letter, fields[i + 1])
+                i += 3
+            else:
+                if i + 1 < len(fields):
+                    files[fields[i + 1]] = (letter, None)
+                i += 2
+        else:
+            i += 1
+    return files
+
+
+
+
+def parse_porcelain_z(out):
+    """Parse `git status --porcelain=v1 -z -uall` → list of entries.
+
+    Each: (xy, path, rename_from or None). In -z mode rename paths come as
+    `R  <new>\\0<old>\\0` — new path first, old path as the next field.
+    """
+    entries = []
+    fields = out.split("\0")
+    i = 0
+    while i < len(fields):
+        f = fields[i]
+        if not f:
+            i += 1
+            continue
+        xy, path = f[:2], f[3:]
+        if xy and xy[0] in ("R", "C") and i + 1 < len(fields):
+            entries.append((xy, path, fields[i + 1]))  # path=new, next=old
+            i += 2
+        else:
+            entries.append((xy, path, None))
+            i += 1
+    return entries
+
+
+def status_letter(xy, untracked):
+    if untracked:
+        return "A"
+    x, y = xy[0], xy[1] if len(xy) > 1 else " "
+    if "R" in (x, y):
+        return "R"
+    if "D" in (x, y):
+        return "D"
+    if "A" in (x, y):
+        return "A"
+    return "M"
+
+
+def untracked_stats(path):
+    """(add_lines, binary) for an untracked file."""
+    full = os.path.join(REPO, path)
+    try:
+        with open(full, "rb") as f:
+            head = f.read(8192)
+            binary = b"\0" in head
+            add = head.count(b"\n")
+            if not binary:
+                rest = b""
+                while True:
+                    chunk = f.read(1 << 16)
+                    if not chunk:
+                        break
+                    rest += chunk
+                add += rest.count(b"\n")
+    except OSError:
+        return 0, True
+    return add, binary
+
+
+def worktree_rev():
+    """Porcelain-only change rev: one git call; detects staged/unstaged/
+    untracked/rename changes (numstat adds nothing to change detection)."""
+    porcelain = git("status", "--porcelain=v1", "-z", "--untracked-files=all", binary=True)
+    return hashlib.sha1(porcelain).hexdigest(), porcelain
+
+def worktree_files():
+    """File rows + totals + rev for the working tree view."""
+    rev, porcelain = worktree_rev()
+    base = head_or_empty_tree()
+    head_arg = "HEAD" if base != EMPTY_TREE else EMPTY_TREE
+    numstat = git("diff", head_arg, "--numstat", "-z", "--find-renames=40%", binary=True)
+
+    ns = parse_numstat_z(numstat.decode("utf-8", "replace"))
+    files = []
+    for xy, path, old in parse_porcelain_z(porcelain.decode("utf-8", "replace")):
+        untracked = xy == "??"
+        if untracked:
+            add, binary = untracked_stats(path)
+            files.append({"path": path, "oldPath": None, "status": "A",
+                          "add": add, "del": 0, "untracked": True, "binary": binary,
+                          "xy": xy, "sig": "A:%d:0" % add})
+            continue
+        # tracked/rename row: stats from numstat (keyed by new path)
+        st = ns.get(path, ("0", "0", None))
+        add = st[0] if st[0] != "-" else 0
+        dele = st[1] if st[1] != "-" else 0
+        binary = st[0] == "-"
+        oldp = old if old else st[2]
+        files.append({"path": path, "oldPath": oldp,
+                      "status": status_letter(xy, False),
+                      "add": int(add), "del": int(dele),
+                      "untracked": False, "binary": binary,
+                      "xy": xy,
+                      "sig": "%s:%d:%d" % (status_letter(xy, False), int(add), int(dele))})
+    files.sort(key=lambda f: f["path"])
+    totals = {"add": sum(f["add"] for f in files), "del": sum(f["del"] for f in files)}
+    branch = git("rev-parse", "--abbrev-ref", "HEAD").strip()
+    return {"rev": rev, "branch": branch, "totals": totals, "files": files, "repoPath": REPO}
+
+def resolve_commit(sha):
+    """Return full sha for a short/full sha; RuntimeError if not a commit."""
+    full = git("rev-parse", "--verify", "--quiet", sha + "^{commit}").strip()
+    if not full:
+        raise RuntimeError("not a commit: %s" % sha)
+    return full
+
+
+def commit_files(base, sha):
+    """File rows + totals for a commit diff (base → sha)."""
+    nstat = parse_numstat_z(git("diff", "--numstat", "-M", "-z", base, sha))
+    nstatus = parse_name_status_z(git("diff", "--name-status", "-M", "-z", base, sha))
+    files = []
+    for path, (letter, old) in nstatus.items():
+        st = nstat.get(path, ("0", "0", None))
+        binary = st[0] == "-"
+        files.append({"path": path, "oldPath": old, "status": letter,
+                      "add": 0 if binary else int(st[0]), "del": 0 if binary else int(st[1]),
+                      "untracked": False, "binary": binary})
+    files.sort(key=lambda f: f["path"])
+    totals = {"add": sum(f["add"] for f in files), "del": sum(f["del"] for f in files)}
+    return files, totals
+
+
+def commit_data(sha):
+    full = resolve_commit(sha)
+    meta = git("show", "-s", "--format=%H%n%an <%ae>%n%aI%n%P%n%s%n%b", full)
+    lines = meta.split("\n")
+    sha_f, author, date, parents_line = lines[0], lines[1], lines[2], lines[3]
+    subject = lines[4] if len(lines) > 4 else ""
+    body = "\n".join(lines[5:]).strip()
+    parents = [p[:7] for p in parents_line.split()] if parents_line.strip() else []
+    try:
+        base = git("rev-parse", "--verify", "--quiet", full + "^").strip() or EMPTY_TREE
+    except RuntimeError:
+        base = EMPTY_TREE
+    files, totals = commit_files(base, full)
+    return {"sha": sha_f, "short": sha_f[:7], "author": author, "date": date,
+            "parents": parents, "subject": subject, "body": body,
+            "totals": totals, "files": files}
+
+
+def diff_worktree(paths, w=False):
+    """Unified diff text for given worktree paths (tracked + untracked mix)."""
+    wf = worktree_files()
+    known = {}
+    for f in wf["files"]:
+        known[f["path"]] = f
+        if f["oldPath"]:
+            known[f["oldPath"]] = f
+    tracked, untracked = [], []
+    for p in paths:
+        f = known.get(p)
+        if f is None:
+            raise ValueError("path not in worktree file list: %s" % p)
+        if f["binary"]:
+            continue
+        if f["untracked"]:
+            if p == f["path"]:
+                untracked.append(p)
+        else:
+            tracked.append(p)
+    out = []
+    if tracked:
+        head_arg = "HEAD" if head_or_empty_tree() != EMPTY_TREE else EMPTY_TREE
+        args = ["diff", head_arg, "-M"]
+        if w:
+            args.append("-w")
+        out.append(git(*(args + ["--"] + tracked)))
+    for p in untracked:
+        cmd = ["git", "-C", REPO, "diff", "--no-index"]
+        if w:
+            cmd.append("-w")
+        cmd += ["--", "/dev/null", p]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode in (0, 1):
+            out.append(r.stdout.decode("utf-8", "replace"))
+    return "".join(out)
+
+
+def diff_commit(sha, paths, w=False):
+    full = resolve_commit(sha)
+    try:
+        base = git("rev-parse", "--verify", "--quiet", full + "^").strip() or EMPTY_TREE
+    except RuntimeError:
+        base = EMPTY_TREE
+    nstatus = parse_name_status_z(git("diff", "--name-status", "-M", "-z", base, full))
+    nstat = parse_numstat_z(git("diff", "--numstat", "-M", "-z", base, full))
+    known = set(nstatus) | set(nstat)
+    for old in [v[1] for v in nstatus.values() if v[1]]:
+        known.add(old)
+    safe = []
+    for p in paths:
+        if p not in known:
+            raise ValueError("path not in commit file list: %s" % p)
+        if p in nstat and nstat[p][0] == "-":
+            continue  # binary
+        safe.append(p)
+    if not safe:
+        return ""
+    args = ["diff", "-M"]
+    if w:
+        args.append("-w")
+    return git(*(args + [base, full, "--"] + safe))
+
+
+def act(path, op):
+    """Stage/unstage/discard a single worktree file (#3)."""
+    wf = worktree_files()
+    known = {}
+    for f in wf["files"]:
+        known[f["path"]] = f
+        if f["oldPath"]:
+            known[f["oldPath"]] = f
+    f = known.get(path)
+    if f is None:
+        raise ValueError("path not in worktree file list: %s" % path)
+    if op == "stage":
+        git("add", "--", f["path"])
+    elif op == "unstage":
+        git("reset", "-q", "HEAD", "--", f["path"])
+    elif op == "discard":
+        if f["untracked"]:
+            os.remove(os.path.join(REPO, f["path"]))
+        else:
+            base = "HEAD" if head_or_empty_tree() != EMPTY_TREE else EMPTY_TREE
+            if base == EMPTY_TREE:
+                raise RuntimeError("cannot discard without HEAD")
+            def in_head(p):
+                r = subprocess.run(["git", "-C", REPO, "cat-file", "-e", "HEAD:" + p],
+                                   capture_output=True)
+                return r.returncode == 0
+            # restore paths HEAD knows; drop newly-added / rename-target paths
+            restore = [p for p in (f["oldPath"], f["path"]) if p and in_head(p)]
+            drop = [p for p in (f["oldPath"], f["path"]) if p and not in_head(p)]
+            if restore:
+                git("checkout", base, "--", *restore)
+            for p in drop:
+                r = subprocess.run(["git", "-C", REPO, "rm", "-q", "-f", "--", p],
+                                   capture_output=True)
+                if r.returncode != 0:
+                    # not in index: remove any lingering worktree copy
+                    subprocess.run(["git", "-C", REPO, "clean", "-qf", "--", p],
+                                   capture_output=True)
+    else:
+        raise ValueError("bad op: %s" % op)
+    return {"ok": True}
+
+
+def commit_staged(message):
+    """Commit the staged index (#13). Gerrit habit: staged changes only."""
+    msg = (message or "").strip()
+    if not msg:
+        raise ValueError("empty commit message")
+    if len(msg) > 4000:
+        raise ValueError("commit message too long")
+    staged = git("diff", "--cached", "--name-only").strip()
+    if not staged:
+        raise ValueError("nothing staged")
+    git("commit", "-m", msg)
+    return {"sha": git("rev-parse", "HEAD").strip()}
+
+
+def upstream_ref():
+    for spec in ("@{upstream}", "origin/master", "origin/main"):
+        try:
+            if git("rev-parse", "--verify", "--quiet", spec).strip():
+                return spec
+        except RuntimeError:
+            continue
+    return None
+
+
+def vsup_data():
+    up = upstream_ref()
+    if up is None:
+        return {"upstream": None, "ahead": 0, "files": [], "totals": {"add": 0, "del": 0}}
+    try:
+        ahead = int(git("rev-list", "--count", up + "..HEAD").strip() or 0)
+    except RuntimeError:
+        ahead = 0
+    files, totals = commit_files(up, "HEAD")
+    return {"upstream": up, "ahead": ahead, "files": files, "totals": totals}
+
+
+def diff_vsup(paths, w=False):
+    up = upstream_ref()
+    if up is None:
+        raise RuntimeError("no upstream branch")
+    nstatus = parse_name_status_z(git("diff", "--name-status", "-M", "-z", up, "HEAD"))
+    nstat = parse_numstat_z(git("diff", "--numstat", "-M", "-z", up, "HEAD"))
+    known = set(nstatus) | set(nstat)
+    for old in [v[1] for v in nstatus.values() if v[1]]:
+        known.add(old)
+    safe = []
+    for p in paths:
+        if p not in known:
+            raise ValueError("path not in vs-upstream file list: %s" % p)
+        if p in nstat and nstat[p][0] == "-":
+            continue  # binary
+        safe.append(p)
+    if not safe:
+        return ""
+    args = ["diff", "-M"]
+    if w:
+        args.append("-w")
+    return git(*(args + [up, "HEAD", "--"] + safe))
+
+
+def notify_badge(clear):
+    """Set/clear the Wave badge on the cockpit web block (#15). Best-effort."""
+    if not os.environ.get("WAVETERM_JWT"):
+        return {"ok": False, "reason": "no jwt"}
+    key = hashlib.md5(REPO.encode()).hexdigest()
+    bf = os.path.join(STATE_DIR, key + ".webblock")
+    try:
+        with open(bf) as f:
+            bid = f.readline().strip()
+    except OSError:
+        return {"ok": False, "reason": "no webblock"}
+    wsh = shutil.which("wsh") or os.path.expanduser("~/.waveterm/bin/wsh")
+    cmd = [wsh, "badge", "circle-exclamation", "--color", "orange", "-b", bid]
+    if clear:
+        cmd.append("--clear")
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=3)
+        return {"ok": True}
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "reason": "wsh failed"}
+
+
+PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="color-scheme" content="dark">
+<title>wvdiff</title>
+<link rel="stylesheet" href="/assets/diff2html.min.css">
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;
+--red:#f85149;--green:#3fb950;--orange:#d29922;--blue:#58a6ff;--hover:#1c2128}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{position:sticky;top:0;z-index:10;background:var(--panel);
+border-bottom:1px solid var(--border);padding:8px 16px;display:flex;
+align-items:center;gap:16px;flex-wrap:wrap}
+.crumb{display:flex;align-items:baseline;gap:10px;font-weight:600}
+.crumb .branch{color:var(--muted);font-weight:400;font-size:12px}
+.crumb .totals{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+nav{display:flex;gap:4px}
+nav button{background:none;border:none;color:var(--muted);font:inherit;
+padding:6px 10px;cursor:pointer;border-bottom:2px solid transparent}
+nav button:hover{color:var(--text)}
+nav button.active{color:var(--text);border-bottom-color:var(--orange)}
+main{padding:12px 16px;max-width:none}
+/* NOTE: the d2h diff table is nested inside a table.files cell, so these
+   rules MUST use child selectors — a bare "table.files td" descendant
+   selector leaks into the diff table and pads every diff row (double
+   row height) and draws separator lines between code lines. */
+table.files{width:100%;table-layout:fixed;border-collapse:collapse;margin-top:8px}
+table.files>thead>tr>th{text-align:left;color:var(--muted);font-weight:400;font-size:11px;
+text-transform:uppercase;letter-spacing:.04em;padding:6px 8px;border-bottom:1px solid var(--border)}
+table.files>tbody>tr>td{padding:5px 8px;border-bottom:1px solid #21262d;vertical-align:middle}
+tr.filerow{cursor:pointer}
+tr.filerow:hover td{background:var(--hover)}
+.badge{display:inline-block;width:16px;height:16px;line-height:16px;text-align:center;
+font-size:11px;font-weight:700;border-radius:3px;color:#0d1117}
+.badge.M{background:var(--orange)}.badge.A{background:var(--green)}
+.badge.D{background:var(--red)}.badge.R{background:var(--blue)}
+.path{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+.path .dir{color:var(--muted)}.path .base{font-weight:600}
+.path .arrow{color:var(--muted);padding:0 2px}
+.bar{display:inline-block;width:100px;height:6px;background:#21262d;border-radius:3px;
+overflow:hidden;vertical-align:middle;white-space:nowrap}
+.bar .a{display:inline-block;height:6px;background:var(--green);vertical-align:top}
+.bar .d{display:inline-block;height:6px;background:var(--red);vertical-align:top}
+.delta{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;white-space:nowrap}
+.delta .plus{color:var(--green)}.delta .minus{color:var(--red)}
+.delta .binarymark{color:var(--muted)}
+tr.totalrow td{border-top:1px solid var(--border);padding:7px 8px;font-weight:600}
+.commitbox{background:var(--panel);border:1px solid var(--border);border-radius:6px;
+padding:12px 14px;margin-bottom:12px}
+.commitbox .subj{font-weight:700;font-size:15px}
+.commitbox .body{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;
+white-space:pre-wrap;margin:8px 0 0;color:#c9d1d9}
+.commitbox .meta{color:var(--muted);font-size:12px;margin-top:8px}
+.commitbox .meta .sha{color:var(--orange);font-family:ui-monospace,Menlo,Consolas,monospace}
+.logrow{display:flex;gap:12px;align-items:baseline;padding:5px 8px;cursor:pointer;
+border-bottom:1px solid #21262d}
+.logrow:hover{background:var(--hover)}
+.logrow .sha{color:var(--orange);font-family:ui-monospace,Menlo,Consolas,monospace}
+.logrow .subj{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.logrow .by,.logrow .dt{color:var(--muted);font-size:12px;white-space:nowrap}
+.diffcell{padding:0 8px 12px;background:var(--panel)}
+.diffbox{border:1px solid var(--border);border-radius:6px;overflow:auto;max-height:75vh}
+.err{color:var(--red);padding:16px;font-family:ui-monospace,Menlo,Consolas,monospace}
+.empty{color:var(--muted);padding:24px;text-align:center}
+.d2h-file-wrapper{margin:0 !important;border:none !important}
+/* Line numbers in-flow: the stock d2h CSS positions the number cells
+   absolutely (out of flow), which drifts from the code rows when the
+   webview's font/DPI metrics differ. Static positioning keeps every
+   number glued to its own code row. display:table-cell is also needed:
+   stock sets display:inline-block, and an inline-block inside a table
+   row gets wrapped in an anonymous cell that auto table layout then
+   stretches — producing a ~130px dead gutter between the numbers and
+   the code. */
+td.d2h-code-linenumber,td.d2h-code-side-linenumber{
+ position:static !important;display:table-cell !important;
+ direction:ltr !important;min-width:3.5em}
+.d2h-code-line,.d2h-code-side-line{width:auto !important;padding:0 1em !important}
+/* Hunk headers (@@ rows): the stock blue tint reads as random blue lines.
+   Treat them as quiet context rows — muted text, no background. */
+.d2h-diff-table td.d2h-info,.d2h-diff-table td.d2h-info div{
+ background:transparent !important;border-color:transparent !important;
+ color:var(--muted) !important}
+/* Flex children refuse to shrink below content width without min-width:0;
+   without this the side-by-side panes blow out to the longest line's width
+   (multi-thousand px) and the right pane lands off-screen. */
+.d2h-files-diff{display:flex !important}
+.d2h-file-side-diff{min-width:0 !important;width:50% !important;overflow-x:auto !important}
+.d2h-file-side-diff table{table-layout:auto}
+.d2h-file-side-diff::-webkit-scrollbar{height:8px}
+.d2h-file-side-diff::-webkit-scrollbar-thumb{background:#30363d;border-radius:4px}
+.d2h-file-side-diff::-webkit-scrollbar-track{background:transparent}
+.d2h-file-side-diff{scrollbar-color:#30363d transparent}
+.d2h-file-header{background:var(--panel) !important;border-color:var(--border) !important;
+ color:var(--text) !important;position:sticky;top:0;z-index:1}
+.viewtoggle{background:var(--panel);border:1px solid var(--border);color:var(--muted);
+ font:12px ui-monospace,Menlo,Consolas,monospace;padding:4px 8px;border-radius:4px;cursor:pointer}
+.viewtoggle:hover{color:var(--text);border-color:var(--muted)}
+table.files>thead>tr>th.chk,table.files>tbody>tr>td.chk{width:28px;text-align:center;padding:5px 0}
+tr.filerow input.rvw{accent-color:var(--orange);cursor:pointer;margin:0}
+tr.filerow.selected td{background:var(--hover)}
+.filterrow{margin:8px 0 0;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.filter{background:var(--panel);border:1px solid var(--border);color:var(--text);
+font:12px ui-monospace,Menlo,Consolas,monospace;padding:4px 8px;border-radius:4px;width:240px}
+.filter:focus{outline:none;border-color:var(--muted)}
+.logcount{color:var(--muted);font:12px ui-monospace,Menlo,Consolas,monospace}
+.viewtoggle.active{color:var(--text);border-color:var(--orange)}
+.actbtn{background:none;border:1px solid var(--border);color:var(--muted);
+font:11px ui-monospace,Menlo,Consolas,monospace;padding:2px 6px;border-radius:3px;
+cursor:pointer;margin-left:4px}
+.actbtn:hover{color:var(--text);border-color:var(--muted)}
+.actbtn.danger:hover{color:var(--red);border-color:var(--red)}
+td.actcell{width:110px;text-align:right;white-space:nowrap}
+.commitbox textarea{width:100%;background:var(--bg);border:1px solid var(--border);
+color:var(--text);font:13px ui-monospace,Menlo,Consolas,monospace;padding:6px 8px;
+border-radius:4px;resize:vertical;box-sizing:border-box}
+.commitrow{display:flex;gap:8px;align-items:center;margin-top:8px}
+.commitrow .errtxt{color:var(--red);font:12px ui-monospace,Menlo,Consolas,monospace}
+.kbdhelp{position:fixed;bottom:8px;right:8px;z-index:9999;background:#000;color:#fff;
+font:12px ui-monospace,Menlo,Consolas,monospace;padding:10px 12px;border:1px solid var(--border);
+border-radius:6px;white-space:pre;display:none}
+#selftest-out{position:fixed;bottom:0;left:0;z-index:99999;background:#000;color:#fff;
+font:12px monospace;white-space:pre-wrap;max-width:100vw;max-height:60vh;overflow:auto;
+margin:0;padding:8px}
+</style></head>
+<body>
+<header>
+ <div class="crumb"><span id="repoName"></span><span class="branch" id="branch"></span>
+ <span class="totals" id="hdrTotals"></span><span class="totals" id="reviewedInfo"></span></div>
+ <nav id="tabs"></nav>
+ <button id="rvwFilter" class="viewtoggle" title="Show unreviewed files only">unreviewed only</button>
+ <button id="wsToggle" class="viewtoggle" title="Ignore whitespace in diffs">w</button>
+ <button id="viewToggle" class="viewtoggle" title="Toggle side-by-side / unified">&#8801;|</button>
+</header>
+<main id="main"><div class="empty">loading…</div></main>
+<script src="/assets/diff2html-ui.min.js"></script>
+<script>
+"use strict";
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const D2H_CFG={drawFileList:false,outputFormat:"side-by-side",matching:"none",
+ synchronisedScroll:true,highlight:true,fileListToggle:false,fileContentToggle:false,
+ stickyFileHeaders:false,colorScheme:"dark"};
+let pollTimer=null, lastRev=null;
+
+const VIEW_KEY="wvdiff-view";
+function loadViewPref(){try{return localStorage.getItem(VIEW_KEY)||"side-by-side";}catch(e){return "side-by-side";}}
+function saveViewPref(v){try{localStorage.setItem(VIEW_KEY,v);}catch(e){/* private mode */}}
+D2H_CFG.outputFormat=loadViewPref();
+
+function setupViewToggle(){
+  const btn=$("#viewToggle");
+  const label=()=>D2H_CFG.outputFormat==="side-by-side"?"\u2261|":"\u2261";
+  btn.textContent=label();
+  btn.addEventListener("click",()=>{
+    D2H_CFG.outputFormat=D2H_CFG.outputFormat==="side-by-side"?"line-by-line":"side-by-side";
+    saveViewPref(D2H_CFG.outputFormat);
+    btn.textContent=label();
+    // re-draw any open diff box in the new format
+    document.querySelectorAll("tr.diffrow").forEach(r=>{
+      const box=r.querySelector(".diffbox");
+      if(box&&box.dataset.diffText){renderDiffBox(box,box.dataset.diffText);}
+    });
+  });
+}
+
+// --- whitespace toggle (#8): persisted, sent with every diff POST; toggling
+// re-fetches open diffs under the new flag.
+const WS_KEY="wvdiff-ws";
+function wsOn(){try{return localStorage.getItem(WS_KEY)==="1";}catch(e){return false;}}
+function saveWs(v){try{v?localStorage.setItem(WS_KEY,"1"):localStorage.removeItem(WS_KEY);}catch(e){/* private mode */}}
+function setupWsToggle(){
+  const btn=$("#wsToggle");
+  const label=()=>wsOn()?"w!":"w";
+  btn.textContent=label();
+  btn.classList.toggle("active",wsOn());
+  btn.addEventListener("click",async()=>{
+    saveWs(!wsOn());
+    btn.textContent=label();
+    btn.classList.toggle("active",wsOn());
+    await refreshOpenDiffs();
+  });
+}
+async function refreshOpenDiffs(){
+  const st=captureState();
+  document.querySelectorAll("tr.diffrow").forEach(r=>r.remove());
+  await restoreState(st);
+}
+
+// --- state preservation (#1): capture expanded paths + scroll, restore after re-render
+let tableRoot=null, filesByPath={}, postDiffCurrent=null, repoPath="";
+function captureState(){
+  const st={paths:[],y:window.scrollY};
+  document.querySelectorAll("tr.diffrow").forEach(dr=>{
+    const fr=dr.previousElementSibling;
+    if(fr&&fr.classList.contains("filerow")&&fr.dataset.path)st.paths.push(fr.dataset.path);
+  });
+  return st;
+}
+async function restoreState(st){
+  for(const p of st.paths){
+    const tr=document.querySelector('tr.filerow[data-path="'+CSS.escape(p)+'"]');
+    if(tr&&filesByPath[p])await toggleRow(tr,filesByPath[p],postDiffCurrent,tableRoot);
+  }
+  window.scrollTo(0,st.y);
+}
+
+// --- reviewed marks (#2): localStorage per repo+path, auto-reset via sig
+function reviewedKey(){return "wvdiff:reviewed:"+(repoPath||"?");}
+function getReviewed(){try{return JSON.parse(localStorage.getItem(reviewedKey())||"{}");}catch(e){return {};}}
+function setReviewed(path,sig){
+  const m=getReviewed();m[path]=sig;
+  try{localStorage.setItem(reviewedKey(),JSON.stringify(m));}catch(e){/* private mode */}
+}
+function clearReviewed(path){
+  const m=getReviewed();delete m[path];
+  try{localStorage.setItem(reviewedKey(),JSON.stringify(m));}catch(e){/* private mode */}
+}
+function isReviewed(f){return !!(f&&f.sig&&getReviewed()[f.path]===f.sig);}
+function reviewedCount(files){return files.filter(isReviewed).length;}
+
+// --- shared filter model (#7 reviewed filter + path filter, #16 log filter)
+const filterState={q:"",unreviewedOnly:false};
+function applyFilter(){
+  let shown=0;
+  document.querySelectorAll("tr.filerow").forEach(tr=>{
+    const f=filesByPath[tr.dataset.path];
+    if(!f)return;
+    const okQ=!filterState.q||f.path.toLowerCase().includes(filterState.q.toLowerCase());
+    const okR=!filterState.unreviewedOnly||!isReviewed(f);
+    const vis=okQ&&okR;
+    tr.style.display=vis?"":"none";
+    if(vis)shown++;
+    const dr=tr.nextElementSibling;
+    if(dr&&dr.classList.contains("diffrow"))dr.style.display=vis?"":"none";
+  });
+  const tot=document.querySelector("tr.totalrow");
+  if(tot)tot.style.display=shown===Object.keys(filesByPath).length?"":"none";
+}
+let logFilterState="";
+function applyLogFilter(){
+  const q=logFilterState.toLowerCase();
+  let shown=0;
+  document.querySelectorAll(".logrow").forEach(r=>{
+    const hit=!q||r.textContent.toLowerCase().includes(q);
+    r.style.display=hit?"":"none";
+    if(hit)shown++;
+  });
+  const lc=$("#logCount");
+  if(lc)lc.textContent=shown+" shown";
+}
+
+function updateReviewHeader(files){
+  const el=$("#reviewedInfo");
+  if(!el)return;
+  if(!files||!files.length){el.textContent="";return;}
+  el.textContent=reviewedCount(files)+"/"+files.length+" reviewed";
+}
+function setupRvwFilterToggle(){
+  const btn=$("#rvwFilter");
+  btn.classList.toggle("active",filterState.unreviewedOnly);
+  btn.addEventListener("click",()=>{
+    filterState.unreviewedOnly=!filterState.unreviewedOnly;
+    btn.classList.toggle("active",filterState.unreviewedOnly);
+    applyFilter();
+  });
+}
+
+// --- keyboard navigation (#6)
+function visibleFileRows(){return [...document.querySelectorAll("tr.filerow")].filter(tr=>tr.style.display!=="none");}
+function selectedRow(){return document.querySelector("tr.filerow.selected");}
+function selectRow(tr,scroll=true){
+  document.querySelectorAll("tr.filerow.selected").forEach(r=>r.classList.remove("selected"));
+  if(tr){tr.classList.add("selected");if(scroll)tr.scrollIntoView({block:"nearest"});}
+}
+function moveSelection(delta){
+  const rows=visibleFileRows();
+  if(!rows.length)return;
+  let i=rows.indexOf(selectedRow());
+  if(i<0)i=0;else i=Math.min(rows.length-1,Math.max(0,i+delta));
+  selectRow(rows[i]);
+}
+function setupKeys(){
+  document.addEventListener("keydown",e=>{
+    if(e.target.tagName==="INPUT"||e.target.tagName==="TEXTAREA")return;
+    const k=e.key;
+    if(k==="j"||k==="n"){moveSelection(1);e.preventDefault();}
+    else if(k==="k"||k==="p"){moveSelection(-1);e.preventDefault();}
+    else if(k==="Enter"){const tr=selectedRow();if(tr)tr.click();e.preventDefault();}
+    else if(k==="/"){const f=$("#pathFilter");if(f){f.focus();e.preventDefault();}}
+    else if(k==="Escape"){
+      const f=$("#pathFilter");
+      if(f){f.value="";filterState.q="";applyFilter();f.blur();}
+      e.preventDefault();
+    }
+    else if(k==="?"){toggleKbdHelp();e.preventDefault();}
+  });
+}
+function toggleKbdHelp(){
+  let el=$("#kbd-help");
+  if(!el){
+    el=document.createElement("pre");el.id="kbd-help";el.className="kbdhelp";
+    el.textContent="j / n  next file\nk / p  prev file\nEnter  toggle diff\n/      filter paths\nEsc    clear filter\n?      toggle this help";
+    document.body.appendChild(el);
+  }
+  el.style.display=el.style.display==="block"?"none":"block";
+}
+
+
+function stopPoll(){if(pollTimer){clearInterval(pollTimer);pollTimer=null;}lastRev=null;}
+function api(p){return fetch(p).then(r=>{if(!r.ok)throw new Error(p+" "+r.status);return r.json();});}
+
+function badge(s){return `<span class="badge ${esc(s)}">${esc(s)}</span>`;}
+function pathCell(f){
+  const arrow=`<span class="arrow">&rarr;</span>`;
+  const fmt=p=>{const i=p.lastIndexOf("/");return i<0?`<span class="base">${esc(p)}</span>`
+    :`<span class="dir">${esc(p.slice(0,i+1))}</span><span class="base">${esc(p.slice(i+1))}</span>`;};
+  return `<span class="path">${f.oldPath?fmt(f.oldPath)+arrow+fmt(f.path):fmt(f.path)}</span>`;
+}
+function bar(f,max){
+  const w=n=>Math.round(n/max*100);
+  return `<span class="bar"><span class="a" style="width:${w(f.add)}px"></span><span class="d" style="width:${w(f.del)}px"></span></span>`;
+}
+function deltaCell(f){
+  if(f.binary)return `<span class="delta"><span class="binarymark">binary</span></span>`;
+  return `<span class="delta"><span class="minus">&minus;${f.del}</span> <span class="plus">+${f.add}</span></span>`;
+}
+
+function fileTable(files,totals,postDiff,withActions){
+  const div=document.createElement("div");
+  if(!files.length){div.className="empty";div.textContent="no changes";return div;}
+  const max=Math.max(1,...files.map(f=>f.add+f.del));
+  let rows=files.map((f,i)=>{
+    const chk=`<input type="checkbox" class="rvw"${isReviewed(f)?" checked":""}>`;
+    let acts="";
+    if(withActions&&f.xy){
+      const btn=(op,label,danger)=>`<button class="actbtn${danger?" danger":""}" data-op="${op}">${label}</button>`;
+      if(f.untracked||f.xy[0]===" "||f.xy[0]==="?")acts=btn("stage","stage")+btn("discard","discard",true);
+      else if(f.xy[0]==="M"||f.xy[0]==="A")acts=btn("unstage","unstage")+btn("discard","discard",true);
+      else acts=btn("stage","stage")+btn("discard","discard",true);
+    }
+    return `
+   <tr class="filerow" data-i="${i}" data-path="${esc(f.path)}"><td class="chk">${chk}</td><td>${badge(f.status)}</td><td>${pathCell(f)}</td>
+   <td>${bar(f,max)}</td><td style="text-align:right">${deltaCell(f)}</td><td class="actcell">${acts}</td></tr>`;}).join("");
+  const t=`<table class="files"><thead><tr><th class="chk"></th><th></th><th>Path</th><th>Size</th>
+   <th style="text-align:right">Delta</th><th class="actcell"></th></tr></thead><tbody>${rows}
+   <tr class="totalrow"><td class="chk"></td><td></td><td>${files.length} file${files.length>1?"s":""}</td><td></td>
+   <td style="text-align:right"><span class="delta"><span class="minus">&minus;${totals.del}</span> <span class="plus">+${totals.add}</span></span></td><td></td></tr>
+   </tbody></table>`;
+  div.innerHTML=t;
+  div.querySelectorAll("tr.filerow").forEach(tr=>{
+    const f=files[+tr.dataset.i];
+    tr.addEventListener("click",()=>toggleRow(tr,f,postDiff,div));
+    const cb=tr.querySelector("input.rvw");
+    if(cb)cb.addEventListener("change",()=>{
+      if(cb.checked)setReviewed(f.path,f.sig);else clearReviewed(f.path);
+      updateReviewHeader(files);
+    });
+    tr.querySelectorAll("button.actbtn").forEach(b=>{
+      b.addEventListener("click",async e=>{
+        e.stopPropagation();
+        const op=b.dataset.op;
+        if(op==="discard"&&!window.confirm("Discard changes in "+f.path+"?"))return;
+        b.disabled=true;
+        try{
+          const r=await fetch("/api/action",{method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({op,path:f.path})});
+          if(!r.ok)throw new Error(await r.text());
+        }catch(err){window.alert("action failed: "+err.message);b.disabled=false;return;}
+        await renderWorktree();
+      });
+    });
+  });
+  return div;
+}
+
+async function toggleRow(tr,f,postDiff,root){
+  const next=tr.nextElementSibling;
+  if(next&&next.classList.contains("diffrow")){next.remove();return;}
+  root.querySelectorAll("tr.diffrow").forEach(r=>r.remove());
+  const dtr=document.createElement("tr");
+  dtr.className="diffrow";
+  const td=document.createElement("td");
+  td.colSpan=6;td.className="diffcell";
+  const box=document.createElement("div");box.className="diffbox";
+  td.appendChild(box);dtr.appendChild(td);
+  tr.after(dtr);
+  box.textContent="loading diff…";
+  let text;
+  if(f.binary){text="Binary file not shown.";}
+  else{
+    try{text=await postDiff(f);}
+    catch(e){text="error: "+e.message;}
+  }
+  renderDiffBox(box,text);
+}
+
+function renderDiffBox(box,text){
+  box.textContent="";
+  box.dataset.diffText=text;
+  if(text==="Binary file not shown."||text.startsWith("error:")){
+    const pre=document.createElement("pre");pre.style.cssText="margin:8px;color:var(--muted)";
+    pre.textContent=text;box.appendChild(pre);return;
+  }
+  if(!text.trim()){box.textContent="(no textual diff)";return;}
+  try{new Diff2HtmlUI(box,text,D2H_CFG).draw();}
+  catch(e){box.textContent=text;}
+}
+
+function postWorktree(f){
+  const paths=[f.path];if(f.oldPath)paths.push(f.oldPath);
+  return fetch("/api/diff/worktree",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({paths,untracked:!!f.untracked,w:wsOn()})}).then(async r=>{
+    if(!r.ok)throw new Error(await r.text());return r.text();});
+}
+function postCommit(sha){return f=>{
+  const paths=[f.path];if(f.oldPath)paths.push(f.oldPath);
+  return fetch("/api/diff/commit",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({sha,paths,w:wsOn()})}).then(async r=>{
+    if(!r.ok)throw new Error(await r.text());return r.text();});
+};}
+function postVsup(f){
+  const paths=[f.path];if(f.oldPath)paths.push(f.oldPath);
+  return fetch("/api/diff/vsup",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({paths,w:wsOn()})}).then(async r=>{
+    if(!r.ok)throw new Error(await r.text());return r.text();});
+}
+
+function tabs(active){
+  $("#tabs").innerHTML=
+   `<button data-p="/" class="${active==="work"?"active":""}">Working tree</button>
+    <button data-p="/vsup" class="${active==="vsup"?"active":""}">vs upstream</button>
+    <button data-p="/log" class="${active==="log"?"active":""}">Log</button>`;
+  $("#tabs").querySelectorAll("button").forEach(b=>b.addEventListener("click",()=>nav(b.dataset.p)));
+}
+
+let capturedState=null;
+async function renderWorktree(){
+  tabs("work");
+  const m=$("#main");m.innerHTML='<div class="empty">loading…</div>';
+  const d=await api("/api/worktree");
+  repoPath=d.repoPath||repoPath;
+  $("#repoName").textContent=d.repo||"";
+  $("#branch").textContent=d.branch?"("+d.branch+")":"";
+  $("#hdrTotals").textContent=d.totals?`+${d.totals.add} \u2212${d.totals.del}`:"";
+  const tbl=fileTable(d.files,d.totals,postWorktree,true);
+  m.innerHTML="";
+  m.appendChild(makeFilterRow());
+  m.appendChild(tbl);
+  m.appendChild(makeCommitBox());
+  tableRoot=tbl;filesByPath={};d.files.forEach(f=>filesByPath[f.path]=f);
+  postDiffCurrent=postWorktree;
+  updateReviewHeader(d.files);
+  lastRev=d.rev;
+  applyFilter();
+  if(d.files.length===1)autoExpand(d.files[0].path);  // single-file auto-expand (#5)
+}
+function makeFilterRow(){
+  const div=document.createElement("div");div.className="filterrow";
+  div.innerHTML=`<input id="pathFilter" class="filter" placeholder="filter paths…">`;
+  const inp=div.querySelector("#pathFilter");
+  inp.value=filterState.q;
+  inp.addEventListener("input",()=>{filterState.q=inp.value;applyFilter();});
+  return div;
+}
+async function renderLog(){
+  tabs("log");
+  const m=$("#main");m.innerHTML='<div class="empty">loading…</div>';
+  const d=await api("/api/log");
+  $("#branch").textContent="";$("#hdrTotals").textContent="";$("#reviewedInfo").textContent="";
+  m.innerHTML="";
+  if(!d.commits.length){m.innerHTML='<div class="empty">no commits</div>';return;}
+  const fdiv=document.createElement("div");fdiv.className="filterrow";
+  fdiv.innerHTML=`<input id="logFilter" class="filter" placeholder="filter log…"><span class="logcount" id="logCount"></span>`;
+  const linp=fdiv.querySelector("#logFilter");
+  linp.value=logFilterState;
+  linp.addEventListener("input",()=>{logFilterState=linp.value;applyLogFilter();});
+  m.appendChild(fdiv);
+  const wrap=document.createElement("div");
+  wrap.innerHTML=d.commits.map(c=>`<div class="logrow" data-sha="${esc(c.sha)}">
+   <span class="sha">${esc(c.short)}</span><span class="subj">${esc(c.subject)}</span>
+   <span class="by">${esc(c.author)}</span><span class="dt">${new Date(c.timestamp*1000).toISOString().slice(0,10)}</span></div>`).join("");
+  wrap.querySelectorAll(".logrow").forEach(r=>r.addEventListener("click",()=>nav("/commit/"+r.dataset.sha)));
+  m.appendChild(wrap);
+  applyLogFilter();
+}
+async function renderVsup(){
+  tabs("vsup");
+  const m=$("#main");m.innerHTML='<div class="empty">loading…</div>';
+  const d=await api("/api/vsup");
+  $("#branch").textContent="";$("#hdrTotals").textContent="";$("#reviewedInfo").textContent="";
+  m.innerHTML="";
+  if(d.upstream===null){m.innerHTML='<div class="empty">no upstream branch</div>';return;}
+  const hdr=document.createElement("div");hdr.className="commitbox";
+  hdr.innerHTML=`<div class="meta">${d.ahead} commit${d.ahead===1?"":"s"} ahead of <span class="sha">${esc(d.upstream)}</span></div>`;
+  m.appendChild(hdr);
+  const tbl=fileTable(d.files,d.totals,postVsup,false);
+  m.appendChild(tbl);
+  tableRoot=tbl;filesByPath={};d.files.forEach(f=>filesByPath[f.path]=f);
+  postDiffCurrent=postVsup;
+}
+async function renderCommit(sha){
+  const m=$("#main");m.innerHTML='<div class="empty">loading…</div>';
+  let d;try{d=await api("/api/commit/"+sha);}catch(e){m.innerHTML=`<div class="err">${esc(e.message)}</div>`;return;}
+  tabs("commit");
+  $("#tabs").innerHTML=`<button data-p="/log">&larr; Log</button>
+   <button disabled style="color:var(--orange);cursor:default">${esc(d.short)}</button>`;
+  $("#tabs").querySelector("button").addEventListener("click",()=>nav("/log"));
+  $("#branch").textContent="";$("#hdrTotals").textContent="";$("#reviewedInfo").textContent="";
+  m.innerHTML=`<div class="commitbox"><div class="subj">${esc(d.subject)}</div>
+   ${d.body?`<div class="body">${esc(d.body)}</div>`:""}
+   <div class="meta"><span class="sha">${esc(d.short)}</span> &middot; ${esc(d.author)}
+   &middot; ${esc(d.date)}${d.parents.length?" &middot; parent"+(d.parents.length>1?"s":"")+": "+d.parents.map(p=>`<span class="sha">${esc(p)}</span>`).join(" "):""}</div></div>`;
+  const tbl=fileTable(d.files,d.totals,postCommit(d.sha),false);
+  m.appendChild(tbl);
+  tableRoot=tbl;filesByPath={};d.files.forEach(f=>filesByPath[f.path]=f);
+  postDiffCurrent=postCommit(d.sha);
+}
+
+// --- commit box (#13): staged changes only, then jump to the new commit
+function makeCommitBox(){
+  const div=document.createElement("div");div.className="commitbox";
+  div.innerHTML=`<textarea id="commitMsg" rows="3" placeholder="commit message (staged changes)"></textarea>
+   <div class="commitrow"><button id="commitBtn" class="viewtoggle">Commit</button><span class="errtxt" id="commitErr"></span></div>`;
+  const btn=div.querySelector("#commitBtn");
+  btn.addEventListener("click",async()=>{
+    const msg=div.querySelector("#commitMsg").value;
+    const err=div.querySelector("#commitErr");err.textContent="";
+    try{
+      const r=await fetch("/api/commit",{method:"POST",
+        headers:{"Content-Type":"application/json"},body:JSON.stringify({message:msg})});
+      if(!r.ok)throw new Error(await r.text());
+      const d=await r.json();
+      nav("/commit/"+d.sha);
+    }catch(e){err.textContent=e.message;}
+  });
+  return div;
+}
+
+function nav(p){history.pushState(null,"",p);route();}
+async function route(){
+  stopPoll();
+  const p=location.pathname;
+  const expand=new URLSearchParams(location.search).get("expand");
+  try{
+    if(p==="/"){
+      capturedState=null;
+      await renderWorktree();
+      if(expand)autoExpand(expand);
+      pollTimer=setInterval(async()=>{
+        try{
+          const c=await api("/api/worktree?cheap=1");
+          if(c.rev!==lastRev){
+            if(document.hidden){
+              fetch("/api/notify",{method:"POST",
+                headers:{"Content-Type":"application/json"},body:"{}"}).catch(()=>{});
+            }
+            capturedState=captureState();
+            await renderWorktree();
+            await restoreState(capturedState);
+          }
+        }catch(e){/* server may be restarting */}
+      },2000);
+    }else if(p==="/log"){await renderLog();}
+    else if(p==="/vsup"){await renderVsup();}
+    else{const m=p.match(/^\/commit\/([0-9a-f]{7,40})$/i);
+      if(m){await renderCommit(m[1]);if(expand)autoExpand(expand);}
+      else await renderLog();}
+  }catch(e){$("#main").innerHTML=`<div class="err">${esc(e.message)}</div>`;}
+}
+function autoExpand(path){
+  const rows=[...document.querySelectorAll("tr.filerow")];
+  for(const tr of rows){
+    if(tr.dataset.path===path){tr.click();return;}
+    if(tr.cells[2]&&tr.cells[2].textContent.includes(path)){tr.click();return;}
+  }
+}
+window.addEventListener("popstate",route);
+document.addEventListener("visibilitychange",()=>{
+  if(!document.hidden)fetch("/api/notify",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:'{"clear":true}'}).catch(()=>{});
+});
+setupViewToggle();
+setupWsToggle();
+setupRvwFilterToggle();
+setupKeys();
+route();
+// ?geom=1: append a layout-geometry report (diagnostic for line-number drift)
+if(new URLSearchParams(location.search).get("geom")==="1"){
+  const wait=setInterval(()=>{
+    const box=document.querySelector(".diffbox");
+    if(box&&box.querySelector(".d2h-file-wrapper")){
+      clearInterval(wait);
+      const r=[];
+      const main=document.querySelector("main");
+      document.querySelectorAll(".d2h-file-wrapper,.d2h-file-diff,.d2h-code-wrapper,.d2h-file-header").forEach((el,i)=>{
+        const cs=getComputedStyle(el);
+        r.push(el.className.split(" ")[0]+i+" rectW="+el.getBoundingClientRect().width.toFixed(1)+" display="+cs.display+" width="+cs.width+" minW="+cs.minWidth);
+      });
+      document.querySelectorAll(".d2h-file-side-diff").forEach((p,i)=>{
+        const cs=getComputedStyle(p);
+        r.push("SIDE"+i+" display="+cs.display+" width="+cs.width+" minW="+cs.minWidth+" overflowX="+cs.overflowX+" flexShrink="+cs.flexShrink);
+      });
+      r.push("main rectW="+main.getBoundingClientRect().width+" scrollW="+main.scrollWidth);
+      r.push("diffbox rectW="+box.getBoundingClientRect().width+" scrollW="+box.scrollWidth+" clientW="+box.clientWidth);
+      const wrap=document.querySelector(".d2h-files-diff");
+      r.push("files-diff rectW="+(wrap?wrap.getBoundingClientRect().width:"?")+" scrollW="+(wrap?wrap.scrollWidth:"?"));
+      document.querySelectorAll(".d2h-file-side-diff").forEach((p,i)=>{
+        const tbl=p.querySelector("table");
+        r.push("pane"+i+" rectW="+p.getBoundingClientRect().width+" clientW="+p.clientWidth+" scrollW="+p.scrollWidth+" tblRectW="+(tbl?tbl.getBoundingClientRect().width:"?")+" tblScrollW="+(tbl?tbl.scrollWidth:"?"));
+      });
+      // per-row number/code alignment sample (first 30 data rows)
+      let bad=0,tot=0;
+      document.querySelectorAll(".d2h-file-side-diff tbody tr").forEach(tr=>{
+        const numTd=tr.querySelector("td.d2h-code-side-linenumber,td.d2h-code-linenumber");
+        const lineEl=tr.querySelector(".d2h-code-side-line,.d2h-code-line");
+        if(!numTd||!lineEl)return;
+        tot++;
+        const a=numTd.getBoundingClientRect(),b=lineEl.getBoundingClientRect();
+        if(Math.abs((a.top+a.height/2)-(b.top+b.height/2))>4)bad++;
+      });
+      r.push("rows="+tot+" offCenter>4px="+bad);
+      const pre=document.createElement("pre");pre.id="geom-out";
+      pre.style.cssText="position:fixed;top:0;left:0;z-index:99999;background:#fff;color:#000;font:12px monospace;white-space:pre-wrap;max-width:100vw;margin:0;padding:8px";
+      pre.textContent=r.join("\n");
+      document.body.appendChild(pre);
+    }
+  },200);
+  setTimeout(()=>clearInterval(wait),10000);
+}
+// ?selftest=1: in-page client-logic regression checks (same diagnostic
+// pattern as ?geom=1; headless runs cannot click, so we drive the DOM here).
+if(new URLSearchParams(location.search).get("selftest")==="1"){
+  (async()=>{
+    const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+    const results=[];
+    const check=(name,ok,detail)=>results.push((ok?"PASS ":"FAIL ")+name+(ok?"":": "+detail));
+    // wait for route() to finish rendering the worktree
+    for(let i=0;i<50&&!document.querySelector("tr.filerow");i++)await sleep(100);
+    await sleep(200);
+    try{
+      // 1. fileTable renders data-path attributes
+      const dps=[...document.querySelectorAll("tr.filerow")].map(tr=>tr.dataset.path);
+      check("fileTable data-path",dps.length>=2&&dps.includes("a.txt")&&dps.includes("b file.txt"),
+        "paths="+JSON.stringify(dps));
+      // 2. captureState returns the expanded path after autoExpand("a.txt")
+      // (?expand already opened it; collapse first so the click re-opens)
+      document.querySelectorAll("tr.diffrow").forEach(r=>r.remove());
+      autoExpand("a.txt");
+      await sleep(300);
+      let st=captureState();
+      check("captureState expanded path",st.paths.includes("a.txt"),
+        "paths="+JSON.stringify(st.paths));
+      // 3. renderWorktree + restore keeps diffrow in DOM and scroll
+      // (spacer makes the page tall enough to scroll — fixture page is short)
+      const spacer=document.createElement("div");spacer.style.height="2000px";
+      document.body.appendChild(spacer);
+      window.scrollTo(0,300);
+      st=captureState();
+      await renderWorktree();
+      await restoreState(st);
+      await sleep(300);
+      check("state restore keeps diffrow",!!document.querySelector("tr.diffrow"),
+        "no diffrow after restore");
+      check("state restore scroll",Math.abs(window.scrollY-300)<50,"scrollY="+window.scrollY);
+      spacer.remove();window.scrollTo(0,0);
+      // 4. reviewed roundtrip; sig change clears; count correct
+      const fa=filesByPath["a.txt"],fb=filesByPath["b file.txt"];
+      setReviewed("a.txt",fa.sig);
+      check("setReviewed/isReviewed roundtrip",isReviewed(fa)===true,"isReviewed returned false");
+      check("sig change clears review",getReviewed()["a.txt"]!=="WRONG"&&isReviewed({path:"a.txt",sig:"X:9:9"})===false,
+        "stale sig still reviewed");
+      check("reviewedCount",reviewedCount([fa,fb])===1,"count="+reviewedCount([fa,fb]));
+      clearReviewed("a.txt");
+      // 5. checkbox click updates store + header
+      const cb=document.querySelector('tr.filerow[data-path="a.txt"] input.rvw');
+      cb.click();
+      check("checkbox click stores review",isReviewed(fa)===true,"not reviewed after click");
+      const hdr=$("#reviewedInfo").textContent;
+      check("reviewedInfo header",/1\/\d+ reviewed/.test(hdr),"header='"+hdr+"'");
+      cb.click();
+      // 6. path filter "b file" → exactly 1 visible filerow
+      filterState.q="b file";applyFilter();
+      let vis=[...document.querySelectorAll("tr.filerow")].filter(tr=>tr.style.display!=="none");
+      check("path filter narrows",vis.length===1,"visible="+vis.length);
+      // 7. unreviewedOnly + q combined → 0 visible when all reviewed
+      setReviewed("b file.txt",fb.sig);
+      filterState.unreviewedOnly=true;applyFilter();
+      vis=[...document.querySelectorAll("tr.filerow")].filter(tr=>tr.style.display!=="none");
+      check("combined filter zero",vis.length===0,"visible="+vis.length);
+      clearReviewed("b file.txt");
+      filterState.q="";filterState.unreviewedOnly=false;applyFilter();
+      // 8. j twice → .selected is 3rd visible row
+      moveSelection(1);
+      document.dispatchEvent(new KeyboardEvent("keydown",{key:"j",bubbles:true}));
+      document.dispatchEvent(new KeyboardEvent("keydown",{key:"j",bubbles:true}));
+      const sel=document.querySelector("tr.filerow.selected");
+      const visAll=[...document.querySelectorAll("tr.filerow")].filter(tr=>tr.style.display!=="none");
+      check("j moves selection",sel===visAll[2],"sel="+(sel?sel.dataset.path:"none")+" want="+(visAll[2]?visAll[2].dataset.path:"?"));
+      // 9. Enter on selected → diffrow appears
+      document.dispatchEvent(new KeyboardEvent("keydown",{key:"Enter",bubbles:true}));
+      await sleep(300);
+      check("Enter expands diff",!!document.querySelector("tr.diffrow"),"no diffrow after Enter");
+      // 10. / focuses pathFilter
+      document.dispatchEvent(new KeyboardEvent("keydown",{key:"/",bubbles:true}));
+      check("slash focuses filter",document.activeElement===$("#pathFilter"),
+        "active="+(document.activeElement&&document.activeElement.id));
+      document.activeElement.blur();
+      // 11. wsOn toggles and postWorktree body contains w:true
+      const realFetch=window.fetch;
+      let captured=null;
+      window.fetch=(u,opts)=>{captured={url:u,body:opts&&opts.body};return Promise.resolve({ok:true,text:()=>Promise.resolve(""),json:()=>Promise.resolve({})});};
+      saveWs(true);
+      await postWorktree(fa);
+      const bodyOk=captured&&captured.body&&captured.body.includes('"w":true');
+      saveWs(false);
+      window.fetch=realFetch;
+      check("ws flag in POST body",bodyOk===true,"body="+(captured&&captured.body));
+      // 12. applyFilter hides totalrow when filtering
+      filterState.q="zzzz-no-match";applyFilter();
+      const tot=document.querySelector("tr.totalrow");
+      check("totalrow hidden when filtered",tot&&tot.style.display==="none","display="+(tot&&tot.style.display));
+      filterState.q="";applyFilter();
+      // 13. autoExpand matches space path
+      document.querySelectorAll("tr.diffrow").forEach(r=>r.remove());
+      autoExpand("b file.txt");
+      await sleep(300);
+      const spRow=document.querySelector('tr.filerow[data-path="b file.txt"]');
+      check("autoExpand space path",!!(spRow&&spRow.nextElementSibling&&spRow.nextElementSibling.classList.contains("diffrow")),
+        "no diffrow for b file.txt");
+      // 14. visibilitychange notify: hidden + rev change → POST /api/notify
+      window.fetch=(u,opts)=>{captured={url:u,body:opts&&opts.body};return Promise.resolve({ok:true,json:()=>Promise.resolve({rev:"x1"})});};
+      Object.defineProperty(document,"hidden",{value:true,configurable:true});
+      lastRev="different";
+      // run one poll iteration body: cheap rev !== lastRev and hidden
+      const c=await api("/api/worktree?cheap=1");
+      if(c.rev!==lastRev&&document.hidden){
+        fetch("/api/notify",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).catch(()=>{});
+      }
+      window.fetch=realFetch;
+      Object.defineProperty(document,"hidden",{value:false,configurable:true});
+      check("notify on hidden change",captured&&captured.url==="/api/notify","url="+(captured&&captured.url));
+      // 15. log filter
+      await renderLog();
+      await sleep(100);
+      logFilterState="c1";applyLogFilter();
+      const lv=[...document.querySelectorAll(".logrow")].filter(r=>r.style.display!=="none");
+      check("log filter narrows",lv.length>=1,"visible="+lv.length);
+      logFilterState="";applyLogFilter();
+    }catch(e){results.push("FAIL selftest exception: "+e.message);}
+    const pre=document.createElement("pre");pre.id="selftest-out";
+    pre.style.cssText="position:fixed;bottom:0;left:0;z-index:99999;background:#000;color:#fff;font:12px monospace;white-space:pre-wrap;max-width:100vw;max-height:60vh;overflow:auto;margin:0;padding:8px";
+    const pass=results.filter(r=>r.startsWith("PASS")).length;
+    pre.textContent=results.join("\n")+"\nSELFTEST "+pass+"/"+results.length;
+    document.body.appendChild(pre);
+  })();
+}
+</script></body></html>"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "wvdiff/1.0"
+
+    def log_message(self, fmt, *args):
+        pass  # per-request noise goes nowhere; errors still go to wvdiff.log
+
+    def _touch(self):
+        global LAST_REQUEST
+        LAST_REQUEST = time.time()
+
+    def _send(self, code, body, ctype):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, obj, code=200):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def _error(self, code, msg):
+        self._send(code, msg, "text/plain")
+
+    def _asset(self, name):
+        path = os.path.join(ASSETS_DIR, os.path.basename(name))
+        if not os.path.isfile(path):
+            return self._error(404, "not found")
+        ctype = "text/css" if name.endswith(".css") else "text/javascript"
+        with open(path, "rb") as f:
+            self._send(200, f.read(), ctype)
+
+    def do_GET(self):
+        self._touch()
+        path = urlparse(self.path).path
+        try:
+            if path == "/healthz":
+                self._json({"repo": REPO, "pid": os.getpid(), "code_mtime": CODE_MTIME})
+            elif path.startswith("/assets/"):
+                self._asset(unquote(path[len("/assets/"):]))
+            elif path in ("/", "/log", "/vsup") or re.match(r"^/commit/[0-9a-fA-F]{7,40}$", path):
+                self._send(200, PAGE, "text/html")
+            elif path == "/api/worktree":
+                qs = urlparse(self.path).query
+                if "cheap=1" in qs.split("&"):
+                    rev, _ = worktree_rev()
+                    return self._json({"rev": rev})
+                d = worktree_files()
+                d["repo"] = os.path.basename(REPO)
+                self._json(d)
+            elif path == "/api/log":
+                out = git("log", "-n", "300", "--format=%H%x1f%h%x1f%an%x1f%at%x1f%s")
+                commits = []
+                for line in out.split("\n"):
+                    if not line:
+                        continue
+                    sha, short, an, at, subj = line.split("\x1f", 4)
+                    commits.append({"sha": sha, "short": short, "author": an,
+                                    "timestamp": int(at), "subject": subj})
+                self._json({"commits": commits})
+            elif path.startswith("/api/commit/"):
+                sha = unquote(path[len("/api/commit/"):])
+                if not re.match(r"^[0-9a-fA-F]{7,40}$", sha):
+                    return self._error(400, "bad sha")
+                self._json(commit_data(sha))
+            elif path == "/api/vsup":
+                self._json(vsup_data())
+            else:
+                self._error(404, "not found")
+        except RuntimeError as e:
+            self._error(500, str(e))
+        except Exception as e:  # noqa: BLE001
+            log("GET %s error: %r" % (path, e))
+            self._error(500, "internal error")
+
+    def _read_json(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0 or n > 1 << 20:
+            raise ValueError("bad body size")
+        return json.loads(self.rfile.read(n).decode("utf-8"))
+
+    def do_POST(self):
+        self._touch()
+        path = urlparse(self.path).path
+        try:
+            body = self._read_json()
+            if path == "/api/diff/worktree":
+                paths = body.get("paths") or []
+                if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+                    return self._error(400, "bad paths")
+                self._send(200, diff_worktree(paths, bool(body.get("w"))), "text/plain")
+            elif path == "/api/diff/commit":
+                sha = body.get("sha") or ""
+                paths = body.get("paths") or []
+                if not re.match(r"^[0-9a-fA-F]{7,40}$", sha):
+                    return self._error(400, "bad sha")
+                if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+                    return self._error(400, "bad paths")
+                self._send(200, diff_commit(sha, paths, bool(body.get("w"))), "text/plain")
+            elif path == "/api/diff/vsup":
+                paths = body.get("paths") or []
+                if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+                    return self._error(400, "bad paths")
+                self._send(200, diff_vsup(paths, bool(body.get("w"))), "text/plain")
+            elif path == "/api/action":
+                op = body.get("op")
+                p = body.get("path")
+                if op not in ("stage", "unstage", "discard"):
+                    return self._error(400, "bad op: %r" % (op,))
+                if not isinstance(p, str) or not p:
+                    return self._error(400, "bad path")
+                self._json(act(p, op))
+            elif path == "/api/commit":
+                message = body.get("message")
+                if not isinstance(message, str):
+                    return self._error(400, "bad message")
+                self._json(commit_staged(message))
+            elif path == "/api/notify":
+                self._json(notify_badge(bool(body.get("clear"))))
+            else:
+                self._error(404, "not found")
+        except (ValueError, json.JSONDecodeError) as e:
+            self._error(400, str(e))
+        except RuntimeError as e:
+            self._error(500, str(e))
+        except Exception as e:  # noqa: BLE001
+            log("POST %s error: %r" % (path, e))
+            self._error(500, "internal error")
+
+
+def main():
+    global REPO, PORT_FILE
+    import argparse
+    ap = argparse.ArgumentParser(description="wvdiff server")
+    ap.add_argument("--repo", required=True)
+    ap.add_argument("--port", type=int, default=0)
+    args = ap.parse_args()
+    REPO = os.path.abspath(args.repo)
+    if not os.path.isdir(os.path.join(REPO, ".git")):
+        sys.stderr.write("wvdiff: not a git repo: %s\n" % REPO)
+        return 1
+    key = hashlib.md5(REPO.encode()).hexdigest()
+    PORT_FILE = os.path.join(STATE_DIR, key + ".port")
+
+    # single instance per repo: non-blocking lock on <key>.lock, held open
+    # for the process lifetime (auto-released on exit, even SIGKILL)
+    lock_file = os.path.join(STATE_DIR, key + ".lock")
+    import fcntl
+    lock_fd = os.open(lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # another wvdiff already owns this repo; wait briefly for its port
+        # file (it may still be starting), then exit quietly
+        for _ in range(30):
+            if os.path.isfile(PORT_FILE):
+                time.sleep(0.1)
+                sys.stderr.write("wvdiff: another instance serves %s\n" % REPO)
+                return 0
+            time.sleep(0.1)
+        sys.stderr.write("wvdiff: lock busy for %s but no port file\n" % REPO)
+        return 0
+
+    srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    port = srv.server_address[1]
+    with open(PORT_FILE, "w") as f:
+        f.write("%d\n" % port)
+    log("serving %s on 127.0.0.1:%d (idle %ds)" % (REPO, port, IDLE_SECS))
+
+    def bye(signum, frame):
+        try:
+            os.unlink(PORT_FILE)
+        except OSError:
+            pass
+        log("signal %d, exiting" % signum)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, bye)
+    signal.signal(signal.SIGINT, bye)
+
+    def idle_watch():
+        while True:
+            time.sleep(2)
+            if time.time() - LAST_REQUEST > IDLE_SECS:
+                try:
+                    os.unlink(PORT_FILE)
+                except OSError:
+                    pass
+                log("idle timeout, exiting")
+                os._exit(0)
+
+    threading.Thread(target=idle_watch, daemon=True).start()
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
