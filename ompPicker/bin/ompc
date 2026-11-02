@@ -1,0 +1,4 @@
+#!/bin/sh
+# ompc: omp session picker for any terminal (Wave widget uses the same file).
+# No args = interactive pick; --list/--raw and friends pass through.
+exec /usr/bin/python3 "$HOME/.waveterm/omp-picker.py" "$@"
