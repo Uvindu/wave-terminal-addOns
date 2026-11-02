@@ -1,6 +1,6 @@
 # ompPicker — omp conversation picker for Wave Terminal
 
-An fzf-driven picker over your past [omp](https://github.com/ohmypi/omp)
+An fzf-driven picker over your past [omp](https://github.com/can1357/oh-my-pi)
 conversations. Pick one and resume it in place, or open it in a new Wave tab.
 
 ## Requirements
